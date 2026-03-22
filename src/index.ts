@@ -573,6 +573,68 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
         inFlightSessions.delete(sessionID)
       }
     },
+    "command.execute.before": async (cmdInput, output) => {
+      if (cmdInput.command !== "tts") return
+
+      const args = cmdInput.arguments.trim()
+      const spaceIdx = args.indexOf(" ")
+      const subcommand = spaceIdx === -1 ? args : args.slice(0, spaceIdx)
+      const rest = spaceIdx === -1 ? "" : args.slice(spaceIdx + 1).trim()
+
+      const pushText = (text: string) => {
+        output.parts.push({ type: "text", text, synthetic: true } as Part)
+      }
+
+      if (subcommand === "full" || subcommand === "summary" || subcommand === "off") {
+        ttsMode = subcommand
+        saveState({ mode: subcommand })
+        pushText(`TTS mode set to: ${subcommand}`)
+        return
+      }
+
+      if (subcommand === "say") {
+        if (!rest) {
+          pushText("Usage: /tts say <text>")
+          return
+        }
+        try {
+          await runTts(pluginInput.$, rest)
+          pushText(`Speaking: ${rest}`)
+        } catch (err) {
+          pushText(`TTS error: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        return
+      }
+
+      if (subcommand === "repeat") {
+        const latest = latestAssistantMessageBySession.get(cmdInput.sessionID)
+        if (!latest) {
+          pushText("No assistant message found in this session")
+          return
+        }
+        const text = assistantTextByMessage.get(latest.messageID)
+        if (!text) {
+          pushText("No assistant message found in this session")
+          return
+        }
+        const sourceModel = latest.providerID && latest.modelID
+          ? { providerID: latest.providerID, modelID: latest.modelID }
+          : undefined
+        try {
+          if (ttsMode === "full") {
+            await runTts(pluginInput.$, text)
+          } else {
+            await summarizeAndSpeak(pluginInput, text, sourceModel)
+          }
+          pushText("Repeating last message")
+        } catch (err) {
+          pushText(`TTS error: ${err instanceof Error ? err.message : String(err)}`)
+        }
+        return
+      }
+
+      pushText("Unknown /tts subcommand. Use: full, summary, off, repeat, say <text>")
+    },
   }
 }
 
