@@ -23,7 +23,6 @@ type OpenCodeConfig = {
 type MaybeData<T> = T | { data: T }
 
 type TTSPluginConfig = {
-  enabled?: boolean
   mode?: "full" | "summary"
   debug?: boolean
   backend?: "edge_tts" | "say"
@@ -33,6 +32,10 @@ type TTSPluginConfig = {
     rate?: string
     volume?: string
   }
+}
+
+type TTSState = {
+  mode?: "full" | "summary" | "off"
 }
 
 const spokenAssistantMessages = new Set<string>()
@@ -57,6 +60,7 @@ const PLUGIN_CONFIG_PATHS = [
   path.join(OPENCODE_DIR, "plugins", "opencode-tts.jsonc"),
   path.join(OPENCODE_DIR, "plugin", "opencode-tts.jsonc"),
 ]
+const STATE_FILE_PATH = path.join(OPENCODE_DIR, "plugins", "opencode-tts-state.json")
 const LOG_PATH = path.join(OPENCODE_DIR, "logs", "opencode-tts.log")
 let currentPluginConfig: TTSPluginConfig = {}
 
@@ -127,14 +131,22 @@ function setPluginConfig(config?: TTSPluginConfig) {
   currentPluginConfig = normalizePluginConfig(config)
 }
 
-function savePluginConfig(updates: Partial<TTSPluginConfig>) {
-  Object.assign(currentPluginConfig, updates)
+function saveState(state: TTSState) {
   try {
-    const dir = path.dirname(PLUGIN_CONFIG_PATHS[0])
+    const dir = path.dirname(STATE_FILE_PATH)
     mkdirSync(dir, { recursive: true })
-    writeFileSync(PLUGIN_CONFIG_PATHS[0], JSON.stringify(currentPluginConfig, null, 2), "utf8")
+    writeFileSync(STATE_FILE_PATH, JSON.stringify(state, null, 2), "utf8")
   } catch (err) {
-    logLine("savePluginConfig.error", serializeUnknown(err))
+    logLine("saveState.error", serializeUnknown(err))
+  }
+}
+
+function loadState(): TTSState {
+  try {
+    const content = readFileSync(STATE_FILE_PATH, "utf8")
+    return JSON.parse(content) as TTSState
+  } catch {
+    return {}
   }
 }
 
@@ -485,8 +497,8 @@ async function summarizeAndSpeak(
 
 export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
   setPluginConfig(loadPluginConfigFromDisk())
-  const cfg = getPluginConfig()
-  ttsMode = cfg.enabled === false ? "off" : (cfg.mode ?? "summary")
+  const state = loadState()
+  ttsMode = state.mode ?? getPluginConfig().mode ?? "summary"
 
   return {
     event: async ({ event }) => {
