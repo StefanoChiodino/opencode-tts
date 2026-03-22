@@ -2,17 +2,22 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk"
 import os from "node:os"
 import path from "node:path"
-import { appendFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs"
+import { appendFileSync, readFileSync, unlinkSync } from "node:fs"
 
 type SummaryModel = {
   providerID: string
   modelID: string
 }
 
+type ProviderOptions = {
+  baseURL?: string
+  apiKey?: string
+}
+
 type OpenCodeConfig = {
   model?: string
   small_model?: string
-  provider?: Record<string, unknown>
+  provider?: Record<string, { options?: ProviderOptions }>
 }
 
 type MaybeData<T> = T | { data: T }
@@ -30,12 +35,9 @@ type TTSPluginConfig = {
 }
 
 const spokenAssistantMessages = new Set<string>()
-const ignoredSessionIDs = new Set<string>()
 const inFlightSessions = new Set<string>()
-const latestAssistantMessageBySession = new Map<string, { messageID: string; model?: AssistantMessage["model"] }>()
+const latestAssistantMessageBySession = new Map<string, { messageID: string; providerID?: string; modelID?: string }>()
 const assistantTextByMessage = new Map<string, string>()
-const latestTextMessageBySession = new Map<string, string>()
-const summarySessionIdleResolvers = new Map<string, () => void>()
 
 const AUTO_ENABLED = readBooleanEnv("OPENCODE_TTS_AUTO", true)
 const DEFAULT_VOICE = process.env.OPENCODE_TTS_VOICE
@@ -43,16 +45,18 @@ const MAX_SENTENCES = clampNumber(readNumberEnv("OPENCODE_TTS_MAX_SENTENCES", 2)
 const SUMMARY_PROVIDER = process.env.OPENCODE_TTS_SUMMARY_PROVIDER
 const SUMMARY_MODEL = process.env.OPENCODE_TTS_SUMMARY_MODEL
 const DEFAULT_EDGE_TTS_COMMAND = ["edge-tts"]
-const PRIVATE_EDGE_TTS_COMMAND = [path.join(os.homedir(), ".opencode-tts", ".venv", "bin", "python"), "-m", "edge_tts"]
+const OPENCODE_DIR = path.join(os.homedir(), ".config", "opencode")
+const VENV_DIR = path.join(OPENCODE_DIR, "tts-venv")
+const VENV_PYTHON = path.join(VENV_DIR, process.platform === "win32" ? "Scripts" : "bin", process.platform === "win32" ? "python.exe" : "python")
+const VENV_EDGE_TTS_COMMAND = [VENV_PYTHON, "-m", "edge_tts"]
 const DEFAULT_EDGE_TTS_VOICE = "en-US-AvaMultilingualNeural"
 const DEFAULT_EDGE_TTS_RATE = "+25%"
 const DEFAULT_EDGE_TTS_VOLUME = "+0%"
 const PLUGIN_CONFIG_PATHS = [
-  path.join(os.homedir(), ".config", "opencode", "plugins", "opencode-tts.jsonc"),
-  path.join(os.homedir(), ".config", "opencode", "plugin", "opencode-tts.jsonc"),
+  path.join(OPENCODE_DIR, "plugins", "opencode-tts.jsonc"),
+  path.join(OPENCODE_DIR, "plugin", "opencode-tts.jsonc"),
 ]
-const LOG_DIR = path.join(os.homedir(), ".opencode-tts")
-const LOG_PATH = path.join(LOG_DIR, "plugin.log")
+const LOG_PATH = path.join(OPENCODE_DIR, "logs", "opencode-tts.log")
 let currentPluginConfig: TTSPluginConfig = {}
 
 function readBooleanEnv(name: string, fallback: boolean) {
@@ -101,7 +105,6 @@ function logLine(message: string, extra?: unknown) {
   try {
     const config = getPluginConfig()
     if (!config.debug) return
-    mkdirSync(LOG_DIR, { recursive: true })
     const suffix = extra === undefined ? "" : ` ${JSON.stringify(extra)}`
     appendFileSync(LOG_PATH, `${new Date().toISOString()} ${message}${suffix}\n`)
   } catch {
@@ -136,13 +139,55 @@ function getPluginConfig() {
   return currentPluginConfig
 }
 
+async function findPython(shell: Parameters<Plugin>[0]["$"]): Promise<string | undefined> {
+  for (const candidate of ["python3", "python"]) {
+    const check = await shell`${candidate} --version`.nothrow().quiet()
+    if (check.exitCode === 0) return candidate
+  }
+  return undefined
+}
+
+async function ensureEdgeTts(shell: Parameters<Plugin>[0]["$"]): Promise<void> {
+  // Already installed in our venv?
+  const venvCheck = await shell`${VENV_PYTHON} -c "import edge_tts"`.nothrow().quiet()
+  if (venvCheck.exitCode === 0) return
+
+  logLine("edge_tts.install.start", { venvDir: VENV_DIR })
+
+  const python = await findPython(shell)
+  if (!python) {
+    logLine("edge_tts.install.no-python")
+    return
+  }
+
+  // Create venv if it doesn't exist yet
+  const venvSetup = await shell`${python} -m venv ${VENV_DIR}`.nothrow().quiet()
+  if (venvSetup.exitCode !== 0) {
+    logLine("edge_tts.install.venv-failed", { stderr: venvSetup.stderr.toString() })
+    return
+  }
+
+  // Install edge-tts into the venv
+  const install = await shell`${VENV_PYTHON} -m pip install --quiet edge-tts`.nothrow().quiet()
+  if (install.exitCode !== 0) {
+    logLine("edge_tts.install.pip-failed", { stderr: install.stderr.toString() })
+    return
+  }
+
+  logLine("edge_tts.install.success")
+}
+
 async function resolveEdgeTtsCommand(shell: Parameters<Plugin>[0]["$"], configured?: string[]) {
   if (configured?.length) return configured
 
-  const [privatePython] = PRIVATE_EDGE_TTS_COMMAND
-  const privateCheck = await shell`${privatePython} -c "import edge_tts"`.nothrow().quiet()
-  if (privateCheck.exitCode === 0) return PRIVATE_EDGE_TTS_COMMAND
+  // Auto-install into our managed venv if needed
+  await ensureEdgeTts(shell)
 
+  // Prefer our managed venv
+  const venvCheck = await shell`${VENV_PYTHON} -c "import edge_tts"`.nothrow().quiet()
+  if (venvCheck.exitCode === 0) return VENV_EDGE_TTS_COMMAND
+
+  // Fall back to whatever is on PATH
   const binary = await shell`command -v edge-tts`.nothrow().quiet()
   if (binary.exitCode === 0) return DEFAULT_EDGE_TTS_COMMAND
 
@@ -233,7 +278,7 @@ function parseModel(model: string): SummaryModel {
 async function resolveSummaryModel(
   client: Parameters<Plugin>[0]["client"],
   directory: string,
-  source?: AssistantMessage["model"],
+  source?: SummaryModel,
 ): Promise<SummaryModel | undefined> {
   if (SUMMARY_PROVIDER && SUMMARY_MODEL) {
     return {
@@ -262,110 +307,68 @@ async function legacyConfigGet(client: Parameters<Plugin>[0]["client"], director
   } as any)
 }
 
-async function legacySessionCreate(client: Parameters<Plugin>[0]["client"], directory: string, title: string) {
-  return client.session.create({
-    query: { directory },
-    body: { title },
-    throwOnError: true,
-  } as any)
-}
-
-async function legacySessionPromptAsync(
-  client: Parameters<Plugin>[0]["client"],
-  input: {
-    sessionID: string
-    directory: string
-    model?: SummaryModel
-    system?: string
-    tools?: Record<string, boolean>
-    format?: { type: "text" }
-    parts: Array<{ type: "text"; text: string }>
-  },
-) {
-  return (client.session as any).promptAsync({
-    path: { id: input.sessionID },
-    query: { directory: input.directory },
-    body: {
-      model: input.model,
-      system: input.system,
-      tools: input.tools,
-      format: input.format,
-      parts: input.parts,
-    },
-    throwOnError: false,
-  })
-}
-
-async function legacySessionDelete(client: Parameters<Plugin>[0]["client"], directory: string, sessionID: string) {
-  return client.session.delete({
-    path: { id: sessionID },
-    query: { directory },
-    throwOnError: false,
-  } as any)
-}
 
 async function summarizeText(
   client: Parameters<Plugin>[0]["client"],
   directory: string,
   inputText: string,
-  sourceModel?: AssistantMessage["model"],
+  sourceModel?: SummaryModel,
 ) {
   logLine("summarize.start", { directory, inputLength: inputText.length, sourceModel })
-  const created = await legacySessionCreate(client, directory, "opencode-tts-summary")
 
-  const summarySessionID = unwrapData(created as MaybeData<{ id: string }>).id
-  ignoredSessionIDs.add(summarySessionID)
-  logLine("summarize.session.created", { summarySessionID })
+  const summaryModel = await resolveSummaryModel(client, directory, sourceModel)
+  logLine("summarize.model", { summaryModel })
+  if (!summaryModel) throw new Error("no model available for summarization")
 
-  try {
-    const summaryPrompt = [
-      `Summarize the following assistant response as spoken audio copy in no more than ${MAX_SENTENCES} short sentences.`,
-      "Keep concrete facts, decisions, and next actions.",
-      "Do not mention that this is a summary.",
-      "Paraphrase instead of copying the opening words when possible.",
-      "Never output chain-of-thought, think tags, reflection tags, or XML-like tags.",
-      "Do not use bullets, numbering, markdown, or preamble.",
-      "",
-      sanitizeForSpeech(inputText),
-    ].join("\n")
+  const config = await legacyConfigGet(client, directory)
+    .then((result) => unwrapData(result as MaybeData<OpenCodeConfig>))
+    .catch(() => undefined)
 
-    const summaryModel = await resolveSummaryModel(client, directory, sourceModel)
-    logLine("summarize.model", { summaryModel })
-    const requestBody = {
-      ...(summaryModel ? { model: summaryModel } : {}),
-      format: { type: "text" },
-      system: "You are a compression model. Never call tools. Reply with plain text only.",
-      tools: {},
-      parts: [
-        {
-          type: "text",
-          text: summaryPrompt,
-        },
+  const providerOptions = config?.provider?.[summaryModel.providerID]?.options
+  const baseURL = providerOptions?.baseURL
+  const apiKey = providerOptions?.apiKey ?? "local"
+  if (!baseURL) throw new Error(`no baseURL found for provider ${summaryModel.providerID}`)
+
+  const summaryPrompt = [
+    `Summarize the following assistant response as spoken audio copy in no more than ${MAX_SENTENCES} short sentences.`,
+    "Keep concrete facts, decisions, and next actions.",
+    "Do not mention that this is a summary.",
+    "Paraphrase instead of copying the opening words when possible.",
+    "Never output chain-of-thought, think tags, reflection tags, or XML-like tags.",
+    "Do not use bullets, numbering, markdown, or preamble.",
+    "",
+    sanitizeForSpeech(inputText),
+  ].join("\n")
+
+  logLine("summarize.direct.request", { baseURL, modelID: summaryModel.modelID })
+  const response = await fetch(`${baseURL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: summaryModel.modelID,
+      messages: [
+        { role: "system", content: "You are a compression model. Reply with plain text only." },
+        { role: "user", content: summaryPrompt },
       ],
-    }
-    logLine("summarize.client.prompt.request", { summarySessionID, body: requestBody })
-    const idlePromise = new Promise<void>((resolve) => {
-      summarySessionIdleResolvers.set(summarySessionID, resolve)
-    })
-    await legacySessionPromptAsync(client, {
-      sessionID: summarySessionID,
-      directory,
-      ...requestBody,
-    })
-    await idlePromise
-    logLine("summarize.session.idle.received", { summarySessionID })
+      max_tokens: 200,
+      stream: false,
+    }),
+  })
 
-    const messageID = latestTextMessageBySession.get(summarySessionID)
-    const rawSummary = messageID ? (assistantTextByMessage.get(messageID) ?? "") : ""
-    const summary = sanitizeForSpeech(rawSummary)
-    logLine("summarize.response.text", { summarySessionID, messageID, summary })
-    if (!summary) throw new Error("summary model returned no text")
-    logLine("summarize.success", { summarySessionID, summary })
-    return summary
-  } finally {
-    await legacySessionDelete(client, directory, summarySessionID)
-    logLine("summarize.session.deleted", { summarySessionID })
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    throw new Error(`summarization request failed: ${response.status} ${body}`)
   }
+
+  const json = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> }
+  const summary = sanitizeForSpeech(json.choices?.[0]?.message?.content ?? "")
+  logLine("summarize.response.text", { summary })
+  if (!summary) throw new Error("summary model returned no text")
+  logLine("summarize.success", { summary })
+  return summary
 }
 
 async function runTts(
@@ -457,7 +460,7 @@ async function runTts(
 async function summarizeAndSpeak(
   input: Parameters<Plugin>[0],
   text: string,
-  sourceModel?: AssistantMessage["model"],
+  sourceModel?: SummaryModel,
   voice?: string,
 ) {
   let summary: string
@@ -475,7 +478,7 @@ async function summarizeAndSpeak(
   return summary
 }
 
-export const OpenCodeTTSPlugin: Plugin = async (input) => {
+export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
   setPluginConfig(loadPluginConfigFromDisk())
 
   return {
@@ -487,7 +490,8 @@ export const OpenCodeTTSPlugin: Plugin = async (input) => {
         if (info.role === "assistant") {
           latestAssistantMessageBySession.set(info.sessionID, {
             messageID: info.id,
-            model: info.model,
+            providerID: info.providerID,
+            modelID: info.modelID,
           })
           logLine("message.updated.assistant", { sessionID: info.sessionID, messageID: info.id })
         }
@@ -496,28 +500,8 @@ export const OpenCodeTTSPlugin: Plugin = async (input) => {
       if (event.type === "message.part.updated") {
         const part = event.properties.part
         if (part.type === "text") {
-          latestTextMessageBySession.set(part.sessionID, part.messageID)
           assistantTextByMessage.set(part.messageID, sanitizeForSpeech(part.text))
           logLine("message.part.updated.text", { messageID: part.messageID, length: part.text.length })
-        }
-      }
-
-      if (event.type === "message.part.delta") {
-        latestTextMessageBySession.set(event.properties.sessionID, event.properties.messageID)
-        const existing = assistantTextByMessage.get(event.properties.messageID) ?? ""
-        const next = sanitizeForSpeech(`${existing} ${event.properties.delta}`)
-        assistantTextByMessage.set(event.properties.messageID, next)
-      }
-
-      if (event.type === "session.error") {
-        logLine("event.session.error", serializeUnknown(event.properties))
-      }
-
-      if (event.type === "session.idle") {
-        const resolver = summarySessionIdleResolvers.get(event.properties.sessionID)
-        if (resolver) {
-          summarySessionIdleResolvers.delete(event.properties.sessionID)
-          resolver()
         }
       }
 
@@ -525,8 +509,7 @@ export const OpenCodeTTSPlugin: Plugin = async (input) => {
       if (event.type !== "session.idle") return
 
       const sessionID = event.properties.sessionID
-      logLine("event.session.idle", { sessionID, inputDirectory: input.directory })
-      if (ignoredSessionIDs.has(sessionID)) return
+      logLine("event.session.idle", { sessionID, inputDirectory: pluginInput.directory })
       if (inFlightSessions.has(sessionID)) return
 
       inFlightSessions.add(sessionID)
@@ -543,7 +526,10 @@ export const OpenCodeTTSPlugin: Plugin = async (input) => {
         logLine("event.session.idle.cached-text", { sessionID, messageID: latest.messageID, textLength: text.length })
         if (!text) return
 
-        const summary = await summarizeAndSpeak(input, text, latest.model)
+        const sourceModel = latest.providerID && latest.modelID
+          ? { providerID: latest.providerID, modelID: latest.modelID }
+          : undefined
+        const summary = await summarizeAndSpeak(pluginInput, text, sourceModel)
         spokenAssistantMessages.add(latest.messageID)
 
         if (getPluginConfig().debug) {
