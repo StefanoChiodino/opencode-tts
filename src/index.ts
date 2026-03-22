@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk"
 import os from "node:os"
 import path from "node:path"
-import { appendFileSync, readFileSync, unlinkSync } from "node:fs"
+import { appendFileSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 
 type SummaryModel = {
   providerID: string
@@ -24,6 +24,7 @@ type MaybeData<T> = T | { data: T }
 
 type TTSPluginConfig = {
   enabled?: boolean
+  mode?: "full" | "summary"
   debug?: boolean
   backend?: "edge_tts" | "say"
   edge_tts?: {
@@ -39,7 +40,7 @@ const inFlightSessions = new Set<string>()
 const latestAssistantMessageBySession = new Map<string, { messageID: string; providerID?: string; modelID?: string }>()
 const assistantTextByMessage = new Map<string, string>()
 
-const AUTO_ENABLED = readBooleanEnv("OPENCODE_TTS_AUTO", true)
+let ttsMode: "full" | "summary" | "off" = "summary"
 const DEFAULT_VOICE = process.env.OPENCODE_TTS_VOICE
 const MAX_SENTENCES = clampNumber(readNumberEnv("OPENCODE_TTS_MAX_SENTENCES", 2), 1, 3)
 const SUMMARY_PROVIDER = process.env.OPENCODE_TTS_SUMMARY_PROVIDER
@@ -58,12 +59,6 @@ const PLUGIN_CONFIG_PATHS = [
 ]
 const LOG_PATH = path.join(OPENCODE_DIR, "logs", "opencode-tts.log")
 let currentPluginConfig: TTSPluginConfig = {}
-
-function readBooleanEnv(name: string, fallback: boolean) {
-  const value = process.env[name]
-  if (!value) return fallback
-  return ["1", "true", "yes", "on"].includes(value.toLowerCase())
-}
 
 function readNumberEnv(name: string, fallback: number) {
   const value = process.env[name]
@@ -130,6 +125,17 @@ function loadPluginConfigFromDisk(): TTSPluginConfig {
 
 function setPluginConfig(config?: TTSPluginConfig) {
   currentPluginConfig = normalizePluginConfig(config)
+}
+
+function savePluginConfig(updates: Partial<TTSPluginConfig>) {
+  Object.assign(currentPluginConfig, updates)
+  try {
+    const dir = path.dirname(PLUGIN_CONFIG_PATHS[0])
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(PLUGIN_CONFIG_PATHS[0], JSON.stringify(currentPluginConfig, null, 2), "utf8")
+  } catch (err) {
+    logLine("savePluginConfig.error", serializeUnknown(err))
+  }
 }
 
 function getPluginConfig() {
@@ -380,7 +386,6 @@ async function runTts(
   if (!normalized) return
 
   const config = getPluginConfig()
-  if (config.enabled === false) return
 
   const backend = config.backend ?? "edge_tts"
 
@@ -480,6 +485,8 @@ async function summarizeAndSpeak(
 
 export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
   setPluginConfig(loadPluginConfigFromDisk())
+  const cfg = getPluginConfig()
+  ttsMode = cfg.enabled === false ? "off" : (cfg.mode ?? "summary")
 
   return {
     event: async ({ event }) => {
@@ -505,7 +512,6 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
         }
       }
 
-      if (!AUTO_ENABLED) return
       if (event.type !== "session.idle") return
 
       const sessionID = event.properties.sessionID
@@ -529,7 +535,16 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
         const sourceModel = latest.providerID && latest.modelID
           ? { providerID: latest.providerID, modelID: latest.modelID }
           : undefined
-        const summary = await summarizeAndSpeak(pluginInput, text, sourceModel)
+
+        if (ttsMode === "off") return
+
+        let summary: string
+        if (ttsMode === "full") {
+          await runTts(pluginInput.$, text)
+          summary = text
+        } else {
+          summary = await summarizeAndSpeak(pluginInput, text, sourceModel)
+        }
         spokenAssistantMessages.add(latest.messageID)
 
         if (getPluginConfig().debug) {
