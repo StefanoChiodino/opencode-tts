@@ -26,6 +26,10 @@ type TTSPluginConfig = {
   mode?: "full" | "summary"
   debug?: boolean
   backend?: "edge_tts" | "say"
+  voice?: string
+  summaryLength?: string
+  summaryProvider?: string
+  summaryModel?: string
   edge_tts?: {
     command?: string[]
     voice?: string
@@ -44,10 +48,7 @@ const latestAssistantMessageBySession = new Map<string, { messageID: string; pro
 const assistantTextByMessage = new Map<string, string>()
 
 let ttsMode: "full" | "summary" | "off" = "summary"
-const DEFAULT_VOICE = process.env.OPENCODE_TTS_VOICE
-const MAX_SENTENCES = clampNumber(readNumberEnv("OPENCODE_TTS_MAX_SENTENCES", 2), 1, 3)
-const SUMMARY_PROVIDER = process.env.OPENCODE_TTS_SUMMARY_PROVIDER
-const SUMMARY_MODEL = process.env.OPENCODE_TTS_SUMMARY_MODEL
+const DEFAULT_SUMMARY_LENGTH = "2 sentences"
 const DEFAULT_EDGE_TTS_COMMAND = ["edge-tts"]
 const OPENCODE_DIR = path.join(os.homedir(), ".config", "opencode")
 const VENV_DIR = path.join(OPENCODE_DIR, "tts-venv")
@@ -63,17 +64,6 @@ const PLUGIN_CONFIG_PATHS = [
 const STATE_FILE_PATH = path.join(OPENCODE_DIR, "plugins", "opencode-tts-state.json")
 const LOG_PATH = path.join(OPENCODE_DIR, "logs", "opencode-tts.log")
 let currentPluginConfig: TTSPluginConfig = {}
-
-function readNumberEnv(name: string, fallback: number) {
-  const value = process.env[name]
-  if (!value) return fallback
-  const parsed = Number.parseInt(value, 10)
-  return Number.isFinite(parsed) ? parsed : fallback
-}
-
-function clampNumber(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value))
-}
 
 function normalizeText(value: string) {
   return value.replace(/\s+/g, " ").trim()
@@ -129,6 +119,19 @@ function loadPluginConfigFromDisk(): TTSPluginConfig {
 
 function setPluginConfig(config?: TTSPluginConfig) {
   currentPluginConfig = normalizePluginConfig(config)
+}
+
+function savePluginConfig(patch: Partial<TTSPluginConfig>) {
+  const updated = { ...currentPluginConfig, ...patch }
+  setPluginConfig(updated)
+  try {
+    const configPath = PLUGIN_CONFIG_PATHS[0]
+    const dir = path.dirname(configPath)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(configPath, JSON.stringify(updated, null, 2), "utf8")
+  } catch (err) {
+    logLine("savePluginConfig.error", serializeUnknown(err))
+  }
 }
 
 function saveState(state: TTSState) {
@@ -281,8 +284,7 @@ function serializeUnknown(value: unknown): unknown {
 
 function fallbackSummaryFromText(text: string) {
   const normalized = sanitizeForSpeech(text)
-  const sentences = normalized.match(/[^.!?]+[.!?]+/g) ?? [normalized]
-  return normalizeText(sentences.slice(0, MAX_SENTENCES).join(" "))
+  return normalized.split(/\s+/).slice(0, 40).join(" ")
 }
 
 function parseModel(model: string): SummaryModel {
@@ -298,10 +300,11 @@ async function resolveSummaryModel(
   directory: string,
   source?: SummaryModel,
 ): Promise<SummaryModel | undefined> {
-  if (SUMMARY_PROVIDER && SUMMARY_MODEL) {
+  const pluginConfig = getPluginConfig()
+  if (pluginConfig.summaryProvider && pluginConfig.summaryModel) {
     return {
-      providerID: SUMMARY_PROVIDER,
-      modelID: SUMMARY_MODEL,
+      providerID: pluginConfig.summaryProvider,
+      modelID: pluginConfig.summaryModel,
     }
   }
 
@@ -347,8 +350,9 @@ async function summarizeText(
   const apiKey = providerOptions?.apiKey ?? "local"
   if (!baseURL) throw new Error(`no baseURL found for provider ${summaryModel.providerID}`)
 
+  const summaryLength = getPluginConfig().summaryLength ?? DEFAULT_SUMMARY_LENGTH
   const summaryPrompt = [
-    `Summarize the following assistant response as spoken audio copy in no more than ${MAX_SENTENCES} short sentences.`,
+    `Summarize the following assistant response as spoken audio copy in ${summaryLength}.`,
     "Keep concrete facts, decisions, and next actions.",
     "Do not mention that this is a summary.",
     "Paraphrase instead of copying the opening words when possible.",
@@ -392,7 +396,7 @@ async function summarizeText(
 async function runTts(
   shell: Parameters<Plugin>[0]["$"],
   text: string,
-  voice = DEFAULT_VOICE,
+  voice?: string,
 ) {
   const normalized = sanitizeForSpeech(text)
   if (!normalized) return
@@ -403,7 +407,7 @@ async function runTts(
 
   if (backend === "edge_tts") {
     const command = await resolveEdgeTtsCommand(shell, config.edge_tts?.command)
-    const edgeVoice = voice ?? config.edge_tts?.voice ?? DEFAULT_EDGE_TTS_VOICE
+    const edgeVoice = voice ?? config.voice ?? config.edge_tts?.voice ?? DEFAULT_EDGE_TTS_VOICE
     const rate = config.edge_tts?.rate ?? DEFAULT_EDGE_TTS_RATE
     const volume = config.edge_tts?.volume ?? DEFAULT_EDGE_TTS_VOLUME
     const outputPath = path.join(
@@ -450,9 +454,10 @@ async function runTts(
     }
   }
 
+  const sayVoice = voice ?? config.voice
   if (process.platform === "darwin") {
-    if (voice) {
-      await shell`/usr/bin/say -v ${voice} ${normalized}`.quiet()
+    if (sayVoice) {
+      await shell`/usr/bin/say -v ${sayVoice} ${normalized}`.quiet()
       return
     }
     await shell`/usr/bin/say ${normalized}`.quiet()
@@ -501,6 +506,13 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
   ttsMode = state.mode ?? getPluginConfig().mode ?? "summary"
 
   return {
+    config: async (config) => {
+      config.command = config.command ?? {}
+      config.command["tts"] = {
+        description: "Control TTS: full | summary | off | repeat | say <text>",
+        template: "$ARGUMENTS",
+      }
+    },
     event: async ({ event }) => {
       logLine("event.received", { type: event.type })
 
@@ -633,7 +645,18 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
         return
       }
 
-      pushText("Unknown /tts subcommand. Use: full, summary, off, repeat, say <text>")
+      if (subcommand === "length") {
+        if (!rest) {
+          const current = getPluginConfig().summaryLength ?? DEFAULT_SUMMARY_LENGTH
+          pushText(`Current summary length: ${current}`)
+          return
+        }
+        savePluginConfig({ summaryLength: rest })
+        pushText(`Summary length set to: ${rest}`)
+        return
+      }
+
+      pushText("Unknown /tts subcommand. Use: full, summary, off, repeat, say <text>, length <description>")
     },
   }
 }
