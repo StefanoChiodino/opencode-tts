@@ -1,139 +1,95 @@
 # opencode-tts
 
-An OpenCode plugin that speaks a very short summary of the assistant response instead of reading the whole answer aloud.
+An [OpenCode](https://opencode.ai) plugin that automatically speaks assistant responses when a session goes idle.
 
-The core idea is simple:
+https://github.com/user-attachments/assets/cf1c3166-dbd7-43b8-8215-1ea12d336463
 
-- wait until the OpenCode session goes idle
-- grab the latest assistant message
-- ask a fast follow-up model call to compress it to at most two sentences
-- speak that summary with the local TTS engine
+## How it works
 
-It also exposes a `tts_summary` tool for manual use.
+The plugin listens for session idle events and automatically:
 
-## Why this plugin
+1. Captures the latest assistant message
+2. Either summarizes it (default) or uses the full text (configurable)
+3. Converts it to speech using a local TTS engine
 
-Raw text-to-speech for long coding responses is usually too verbose. This plugin makes TTS practical by turning each answer into short spoken audio copy first.
+## Install
 
-## Current behavior
+Tell OpenCode:
 
-- Automatic mode runs on `session.idle`
-- Summaries are capped to `2` sentences by default
-- TTS defaults to the locally installed `edge_tts` package
-- Default voice is `en-US-AvaMultilingualNeural`
-- Default speech rate is `+25%`
-- A throwaway OpenCode session is used for the summarization pass so the spoken output is model-generated, not truncated raw text
+```text
+Install plugin opencode-tts
+```
 
-## Configuration
-
-OpenCode's main config schema is strict, so arbitrary plugin keys are rejected. This plugin uses a sidecar config file at `~/.config/opencode/plugins/opencode-tts.jsonc`. Preferred: use OpenCode's native `small_model` in your main config. The plugin will use that first for the summary pass, then fall back to the main response model if `small_model` is not set.
-
-Example:
+Or add to your OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
-  "model": "mlx-local/mlx-community/Qwen3.5-35B-A3B-4bit",
-  "small_model": "mlx-local/qwen3.5-0.8b-mlx"
+  "plugin": ["opencode-tts"]
 }
 ```
 
+## Modes
+
+- **summary** (default): Auto-speaks a summarized version of each response
+- **full**: Auto-speaks the complete response text
+
+## User controls
+
+Use these slash commands to manage TTS behavior:
+
+| Command | Effect |
+| --- | --- |
+| `/tts-mode-summary` | Switch to summary mode (default) |
+| `/tts-mode-full` | Switch to full text mode |
+| `/tts-on` | Enable automatic TTS |
+| `/tts-off` | Disable automatic TTS |
+| `/tts-speak <text>` | Speak arbitrary text immediately |
+| `/tts-repeat` | Re-speak the last response in the current session |
+
+Mode and status changes persist across sessions.
+
+## Configuration
+
+Plugin settings live in `~/.config/opencode/plugins/opencode-tts.jsonc`:
+
 ```jsonc
-// ~/.config/opencode/plugins/opencode-tts.jsonc
 {
-  "enabled": true,
-  "debug": true,
-  "backend": "edge_tts",
+  "enabled": true,          // false to disable TTS — persisted across sessions
+  "mode": "summary",        // "summary" | "full" — persisted across sessions
+  "debug": false,
+  "backend": "edge_tts",    // "edge_tts" | "say"
+  "voice": "...",           // voice override for the active backend
+  "summaryLength": "2 sentences", // free-text length hint passed to the LLM (e.g. "30 words", "3 short sentences")
+  "summaryProvider": "...", // provider ID for the summary model
+  "summaryModel": "...",    // model ID for the summary model
   "edge_tts": {
-    "command": ["/Users/stefano/.opencode-tts/.venv/bin/python", "-m", "edge_tts"],
-    "voice": "en-US-AvaMultilingualNeural",
+    "voice": "en-US-AvaNeural",
     "rate": "+25%",
     "volume": "+0%"
   }
 }
 ```
 
-Optional overrides: set environment variables before launching OpenCode:
+The plugin auto-installs `edge-tts` into a managed Python venv at `~/.config/opencode/tts-venv` on first use.
 
-```bash
-export OPENCODE_TTS_AUTO=true
-export OPENCODE_TTS_VOICE=Samantha
-export OPENCODE_TTS_SUMMARY_PROVIDER=openai
-export OPENCODE_TTS_SUMMARY_MODEL=gpt-4.1-mini
-export OPENCODE_TTS_MAX_SENTENCES=2
-```
+### Summary model
 
-Notes:
+The plugin resolves the model for summary generation in this order:
 
-- If OpenCode `small_model` is set, the plugin uses that for summaries.
-- If `OPENCODE_TTS_SUMMARY_PROVIDER` and `OPENCODE_TTS_SUMMARY_MODEL` are set, they override `small_model`.
-- If neither is set, the plugin falls back to the provider/model used for the original assistant response.
-- `OPENCODE_TTS_MAX_SENTENCES` is clamped to `1-3`.
+1. `summaryProvider` + `summaryModel` from the plugin config
+2. `small_model` from your OpenCode config
+3. The same model that produced the assistant response
+4. Text fallback: first 40 words of the raw response
 
-## Summary Fallback Order
+## TTS backends
 
-The plugin currently resolves summary generation in this order:
+**`edge_tts`** (default): Uses Microsoft Edge's neural TTS. Auto-installed. Requires an audio player: `afplay` (macOS built-in), `ffplay`, or `mpg123`.
 
-1. `small_model` from OpenCode config, if set
-2. the same provider/model that produced the assistant response
-3. a local text fallback that trims the assistant response to the first couple of sentences if the summary call fails
+The default voice is `en-US-AvaNeural`, which is recommended for English. Edge TTS supports a wide range of languages and locales — you can use any multilingual voice (e.g. `en-US-AvaMultilingualNeural`) or switch to a completely different language (e.g. `it-IT-ElsaNeural` for Italian, `fr-FR-DeniseNeural` for French). Run `edge-tts --list-voices` to see all available voices.
 
-This means the plugin can still speak something useful even when the configured small model is unavailable or broken.
+**`say`**: Uses macOS `say` or Linux `spd-say`/`espeak`. No install needed.
 
-## Current MLX Notes
-
-During local testing against the MLX server on `localhost:8080`:
-
-- `mlx-community/Qwen3.5-0.8B-OptiQ-4bit` failed to load
-- `mlx-community/Qwen3.5-2B-OptiQ-4bit` failed to load with missing `vision_tower` parameters
-- `mlx-community/Qwen2.5-1.5B-Instruct-4bit` failed because the current `mlx_vlm` install did not support that model type
-
-Because of that, the recommended current setup is to leave `small_model` unset and let the plugin fall back to the main model until the MLX model compatibility issue is fixed.
-
-## OpenCode Route Bug
-
-While debugging the summary path, we found a separate OpenCode server bug in:
-
-- `/Users/stefano/repos/opencode/packages/opencode/src/server/routes/session.ts`
-
-The `POST /session/:sessionID/message` route used Hono's streaming helper and called `stream.write(JSON.stringify(msg))` without awaiting it. In this runtime, that let the callback return before the write flushed, so the server could respond with:
-
-- `HTTP 200`
-- `Content-Length: 0`
-- empty body
-
-That made the plugin look like it was failing to parse summary output, but the real issue was that the route returned no bytes even though the throwaway summary session had already generated text internally.
-
-The fix is to `await stream.write(...)` before the callback exits.
-
-## Files
-
-Current locations:
-
-- Plugin source: `/Users/stefano/repos/opencode-tts/src/index.ts`
-- Plugin README: `/Users/stefano/repos/opencode-tts/README.md`
-- OpenCode config: `/Users/stefano/.config/opencode/opencode.json`
-- Plugin config: `/Users/stefano/.config/opencode/plugins/opencode-tts.jsonc`
-- Private TTS environment: `/Users/stefano/.opencode-tts/.venv`
-- Debug log: `/Users/stefano/.opencode-tts/plugin.log`
-
-## TTS configuration
-
-Speech settings live in `~/.config/opencode/plugins/opencode-tts.jsonc`. Example:
-
-```jsonc
-{
-  "enabled": true,
-  "backend": "edge_tts",
-  "edge_tts": {
-    "command": ["edge-tts"],
-    "voice": "en-US-AvaMultilingualNeural",
-    "rate": "+25%",
-    "volume": "+0%"
-  }
-}
-```
-
-If the local package command is not on your PATH, point `command` at the installed executable or use:
+To use a custom edge-tts executable:
 
 ```jsonc
 {
@@ -143,34 +99,19 @@ If the local package command is not on your PATH, point `command` at the install
 }
 ```
 
-## Install for local development
+## Local development
+
+Build:
 
 ```bash
-cd ~/repos/opencode-tts
 npm install
 npm run build
 ```
 
-Then add the plugin in your OpenCode config:
+Checkout and point to local plugin:
 
 ```json
 {
-  "plugin": ["file:///Users/stefano/repos/opencode-tts/src/index.ts"]
+  "plugin": ["file:///path/to/opencode-tts/dist/index.js"]
 }
 ```
-
-If you want a bundled artifact for publishing, point OpenCode at `dist/index.js` after `npm run build`.
-
-## Manual tool
-
-The plugin exports a `tts_summary` tool with:
-
-- `text`: source text to summarize and speak
-- `voice`: optional voice override
-
-## Next useful upgrades
-
-- configurable summary prompt styles such as `brief`, `status`, and `next-step`
-- output audio file support
-- per-project voice settings
-- debounce rules so only user-visible assistant turns are spoken
