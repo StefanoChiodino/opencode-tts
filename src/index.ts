@@ -564,7 +564,7 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
           ("_tag" in error
             ? (error as Record<string, unknown>)._tag === "QuestionRejectedError"
             : error instanceof Error && error.message.includes("QuestionRejectedError"))
-        if (!isQuestionRejected) {
+        if (!isQuestionRejected && getPluginConfig().debug) {
           console.error("[opencode-tts] failed to summarize and speak", error)
         }
         logLine("event.session.idle.error", {
@@ -637,10 +637,12 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
 
       if (cmdInput.command === "tts-uninstall") {
         const pluginDir = path.join(OPENCODE_DIR, "plugin")
+        const commandDir = path.join(OPENCODE_DIR, "command")
         const filesToRemove = [
           path.join(pluginDir, "opencode-tts.js"),
           path.join(pluginDir, "opencode-tts.js.map"),
           path.join(pluginDir, "opencode-tts.jsonc"),
+          ...TTS_COMMANDS.map((cmd) => path.join(commandDir, `${cmd.name}.md`)),
         ]
         for (const f of filesToRemove) {
           try { unlinkSync(f) } catch { /* already gone */ }
@@ -650,11 +652,24 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
         const opencodeJsonPath = path.join(OPENCODE_DIR, "opencode.json")
         try {
           const raw = readFileSync(opencodeJsonPath, "utf8")
-          const cleaned = raw
-            .split("\n")
-            .filter((line) => !/["']opencode-tts["']/.test(line) && !/file:\/\/[^"']*opencode-tts/.test(line))
-            .join("\n")
-          writeFileSync(opencodeJsonPath, cleaned, "utf8")
+          const parsed = JSON.parse(stripJsonComments(raw)) as { plugin?: string[] }
+          if (Array.isArray(parsed.plugin)) {
+            parsed.plugin = parsed.plugin.filter(
+              (p) => !p.includes("opencode-tts") && !/file:\/\/[^"']*opencode-tts/.test(p),
+            )
+          }
+          writeFileSync(opencodeJsonPath, JSON.stringify(parsed, null, 2), "utf8")
+        } catch { /* best effort */ }
+
+        // Remove from opencode plugin cache
+        const cachePackageJsonPath = path.join(os.homedir(), ".cache", "opencode", "package.json")
+        try {
+          const raw = readFileSync(cachePackageJsonPath, "utf8")
+          const pkg = JSON.parse(raw) as { dependencies?: Record<string, string> }
+          if (pkg.dependencies) {
+            delete pkg.dependencies["opencode-tts"]
+            writeFileSync(cachePackageJsonPath, JSON.stringify(pkg, null, 2), "utf8")
+          }
         } catch { /* best effort */ }
 
         console.log("[opencode-tts] Plugin files removed. Please restart opencode.")
