@@ -52,7 +52,7 @@ const OPENCODE_DIR = path.join(os.homedir(), ".config", "opencode")
 const VENV_DIR = path.join(OPENCODE_DIR, "tts-venv")
 const VENV_PYTHON = path.join(VENV_DIR, process.platform === "win32" ? "Scripts" : "bin", process.platform === "win32" ? "python.exe" : "python")
 const VENV_EDGE_TTS_COMMAND = [VENV_PYTHON, "-m", "edge_tts"]
-const DEFAULT_EDGE_TTS_VOICE = "en-US-AvaMultilingualNeural"
+const DEFAULT_EDGE_TTS_VOICE = "en-US-AvaNeural"
 const DEFAULT_EDGE_TTS_RATE = "+25%"
 const DEFAULT_EDGE_TTS_VOLUME = "+0%"
 const PLUGIN_CONFIG_PATHS = [
