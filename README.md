@@ -45,6 +45,7 @@ Use these slash commands to manage TTS behavior:
 | `/tts-off` | Disable automatic TTS |
 | `/tts-speak <text>` | Speak arbitrary text immediately |
 | `/tts-repeat` | Re-speak the last response in the current session |
+| `/tts-uninstall` | Remove plugin files and clean up `opencode.json` |
 
 Mode and status changes persist across sessions.
 

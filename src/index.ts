@@ -485,6 +485,7 @@ const TTS_COMMANDS: Array<{ name: string; description: string; template: string 
   { name: "tts-off", description: "Disable automatic TTS", template: "TTS disabled." },
   { name: "tts-speak", description: "Speak arbitrary text aloud immediately", template: "$ARGUMENTS" },
   { name: "tts-repeat", description: "Re-speak the last response in the current session", template: "Repeat last TTS message." },
+  { name: "tts-uninstall", description: "Remove opencode-tts plugin files and restart opencode", template: "Uninstalling opencode-tts..." },
 ]
 
 export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
@@ -631,6 +632,32 @@ export const OpenCodeTTSPlugin: Plugin = async (pluginInput) => {
             speak.catch((err) => logLine("tts-repeat.error", serializeUnknown(err)))
           }
         }
+        throw new Error("Command handled by TTS plugin")
+      }
+
+      if (cmdInput.command === "tts-uninstall") {
+        const pluginDir = path.join(OPENCODE_DIR, "plugin")
+        const filesToRemove = [
+          path.join(pluginDir, "opencode-tts.js"),
+          path.join(pluginDir, "opencode-tts.js.map"),
+          path.join(pluginDir, "opencode-tts.jsonc"),
+        ]
+        for (const f of filesToRemove) {
+          try { unlinkSync(f) } catch { /* already gone */ }
+        }
+
+        // Remove plugin entry from opencode.json
+        const opencodeJsonPath = path.join(OPENCODE_DIR, "opencode.json")
+        try {
+          const raw = readFileSync(opencodeJsonPath, "utf8")
+          const cleaned = raw
+            .split("\n")
+            .filter((line) => !/["']opencode-tts["']/.test(line) && !/file:\/\/[^"']*opencode-tts/.test(line))
+            .join("\n")
+          writeFileSync(opencodeJsonPath, cleaned, "utf8")
+        } catch { /* best effort */ }
+
+        console.log("[opencode-tts] Plugin files removed. Please restart opencode.")
         throw new Error("Command handled by TTS plugin")
       }
     },
