@@ -187,7 +187,7 @@ async function resolveEdgeTtsCommand(shell: Parameters<Plugin>[0]["$"], configur
   if (venvCheck.exitCode === 0) return VENV_EDGE_TTS_COMMAND
 
   // Fall back to whatever is on PATH
-  const binary = await shell`command -v edge-tts`.nothrow().quiet()
+  const binary = await shell`which edge-tts`.nothrow().quiet()
   if (binary.exitCode === 0) return DEFAULT_EDGE_TTS_COMMAND
 
   const pythonModule = await shell`python3 -c "import edge_tts"`.nothrow().quiet()
@@ -410,13 +410,13 @@ async function runTts(
         return
       }
 
-      const ffplay = await shell`command -v ffplay`.nothrow().quiet()
+      const ffplay = await shell`which ffplay`.nothrow().quiet()
       if (ffplay.exitCode === 0) {
         await shell`ffplay -nodisp -autoexit -loglevel quiet ${outputPath}`.quiet()
         return
       }
 
-      const mpg123 = await shell`command -v mpg123`.nothrow().quiet()
+      const mpg123 = await shell`which mpg123`.nothrow().quiet()
       if (mpg123.exitCode === 0) {
         await shell`mpg123 -q ${outputPath}`.quiet()
         return
@@ -442,13 +442,13 @@ async function runTts(
     return
   }
 
-  const spdSay = await shell`command -v spd-say`.nothrow().quiet()
+  const spdSay = await shell`which spd-say`.nothrow().quiet()
   if (spdSay.exitCode === 0) {
     await shell`spd-say ${normalized}`.quiet()
     return
   }
 
-  const espeak = await shell`command -v espeak`.nothrow().quiet()
+  const espeak = await shell`which espeak`.nothrow().quiet()
   if (espeak.exitCode === 0) {
     await shell`espeak ${normalized}`.quiet()
     return
